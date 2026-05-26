@@ -16,12 +16,11 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   const wrapperRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const pathRef = useRef<number[]>([]);
-  // Store tile centers for fast nearest-tile lookup
   const tileCenters = useRef<{ x: number; y: number }[]>([]);
+  const lastPos = useRef<{ x: number; y: number } | null>(null);
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
-  // Compute and cache tile centers (called on mount + resize)
   const computeTileCenters = useCallback(() => {
     tileCenters.current = tileRefs.current.map(el => {
       if (!el) return { x: 0, y: 0 };
@@ -31,27 +30,38 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   }, []);
 
   useEffect(() => {
-    computeTileCenters();
+    // Small delay so tiles are rendered before measuring
+    const t = setTimeout(computeTileCenters, 100);
     window.addEventListener('resize', computeTileCenters);
-    return () => window.removeEventListener('resize', computeTileCenters);
+    return () => { clearTimeout(t); window.removeEventListener('resize', computeTileCenters); };
   }, [computeTileCenters]);
 
-  // Find nearest tile within snap radius
-  const getNearestTile = useCallback((x: number, y: number): number => {
-    // Snap radius = roughly 60% of tile size
+  // Get the single best tile for a touch point.
+  // Key insight: prefer tiles that are adjacent to the last tile in path,
+  // and use a generous radius. This makes diagonal feel natural.
+  const getBestTile = useCallback((x: number, y: number, prevIdx: number): number => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return -1;
     const tileSize = wrapper.getBoundingClientRect().width / 4;
-    const snapRadius = tileSize * 0.75;
+    // Use a larger radius — about half a tile width
+    // This means you just need to be closer to a tile than ~half the tile distance
+    const snapRadius = tileSize * 0.85;
 
     let best = -1;
-    let bestDist = snapRadius;
+    let bestScore = Infinity;
+
     for (let i = 0; i < 16; i++) {
       const c = tileCenters.current[i];
       if (!c) continue;
       const dist = Math.hypot(x - c.x, y - c.y);
-      if (dist < bestDist) {
-        bestDist = dist;
+      if (dist > snapRadius) continue;
+
+      // Weight: adjacent tiles to last tile get a bonus (lower score = better)
+      const adjacentBonus = (prevIdx >= 0 && isAdjacent(prevIdx, i)) ? 0.6 : 1.0;
+      const weighted = dist * adjacentBonus;
+
+      if (weighted < bestScore) {
+        bestScore = weighted;
         best = i;
       }
     }
@@ -75,35 +85,37 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
       line.setAttribute('x2', String(b.x - wr.left));
       line.setAttribute('y2', String(b.y - wr.top));
       line.setAttribute('stroke', '#3b82f6');
-      line.setAttribute('stroke-width', '5');
+      line.setAttribute('stroke-width', '6');
       line.setAttribute('stroke-linecap', 'round');
-      line.setAttribute('opacity', '0.75');
+      line.setAttribute('opacity', '0.8');
       svg.appendChild(line);
     }
   }, []);
 
   const startDrag = useCallback((x: number, y: number) => {
     if (!active) return;
-    computeTileCenters(); // refresh in case of scroll/layout shift
-    const i = getNearestTile(x, y);
+    computeTileCenters();
+    const i = getBestTile(x, y, -1);
     if (i < 0) return;
     dragging.current = true;
+    lastPos.current = { x, y };
     pathRef.current = [i];
     setPath([i]);
     drawPathFromRef();
-  }, [active, getNearestTile, drawPathFromRef, computeTileCenters]);
+  }, [active, getBestTile, drawPathFromRef, computeTileCenters]);
 
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
-    const i = getNearestTile(x, y);
-    if (i < 0) return;
+    lastPos.current = { x, y };
 
     const prev = pathRef.current;
-    if (prev.length === 0) return;
-    const last = prev[prev.length - 1];
-    if (i === last) return;
+    const lastIdx = prev[prev.length - 1];
 
-    // Backtrack if moving back to second-to-last tile
+    // Only snap to a new tile if we have a clear candidate adjacent to last tile
+    const i = getBestTile(x, y, lastIdx);
+    if (i < 0 || i === lastIdx) return;
+
+    // Backtrack
     if (prev.length >= 2 && i === prev[prev.length - 2]) {
       const next = prev.slice(0, -1);
       pathRef.current = next;
@@ -113,17 +125,18 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     }
 
     if (prev.includes(i)) return;
-    if (!isAdjacent(last, i)) return;
+    if (!isAdjacent(lastIdx, i)) return;
 
     const next = [...prev, i];
     pathRef.current = next;
     setPath(next);
     drawPathFromRef();
-  }, [active, getNearestTile, drawPathFromRef]);
+  }, [active, getBestTile, drawPathFromRef]);
 
   const endDrag = useCallback(() => {
     if (!dragging.current) return;
     dragging.current = false;
+    lastPos.current = null;
 
     const p = pathRef.current;
     const word = p.map(i => board[i].toLowerCase()).join('');
@@ -144,7 +157,6 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     if (svgRef.current) svgRef.current.innerHTML = '';
   }, [board, foundWords, onWordFound, onWordAttempt]);
 
-  // Touch events — passive:false is critical to block iOS scroll during swipe
   useEffect(() => {
     const el = wrapperRef.current;
     if (!el) return;
@@ -221,7 +233,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         </div>
       </div>
 
-      {/* Grid */}
+      {/* Grid — no gap between tiles so the touch surface is continuous */}
       <div
         ref={wrapperRef}
         style={{
@@ -230,9 +242,8 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
           userSelect: 'none',
           WebkitUserSelect: 'none',
           width: '100%',
-          maxWidth: 400,
-          // Larger hit area padding so edge tiles are easier to start on
-          padding: 4,
+          maxWidth: 420,
+          padding: 2,
         }}
         onMouseDown={e => { computeTileCenters(); startDrag(e.clientX, e.clientY); }}
         onMouseMove={e => { if (dragging.current) moveDrag(e.clientX, e.clientY); }}
@@ -250,7 +261,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         <div style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(4, 1fr)',
-          gap: 8,
+          gap: 6,
           width: '100%',
         }}>
           {board.map((letter, i) => {
@@ -263,26 +274,20 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
                 ref={el => { tileRefs.current[i] = el; }}
                 style={{
                   aspectRatio: '1',
-                  background: isActive
-                    ? 'var(--tile-active)'
-                    : isInPath
-                    ? '#1e3a5f'
-                    : 'var(--tile-bg)',
+                  background: isActive ? 'var(--tile-active)' : isInPath ? '#1e3a5f' : 'var(--tile-bg)',
                   border: `2px solid ${isActive ? '#3b82f6' : isInPath ? '#2563eb' : 'var(--tile-border)'}`,
                   borderRadius: 14,
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   fontFamily: "'Bebas Neue', sans-serif",
-                  // Bigger letters = easier to see while swiping
-                  fontSize: 'clamp(26px, 8vw, 36px)',
+                  fontSize: 'clamp(28px, 8.5vw, 38px)',
                   color: isActive ? '#fff' : isInPath ? 'var(--blue)' : 'var(--text)',
                   transform: isActive ? 'scale(1.12)' : 'scale(1)',
-                  transition: 'transform 0.07s, background 0.07s, border-color 0.07s',
+                  transition: 'transform 0.06s, background 0.06s, border-color 0.06s',
                   boxShadow: isActive ? '0 0 20px var(--tile-glow)' : 'none',
                   zIndex: isActive ? 2 : 1,
                   position: 'relative',
-                  cursor: 'pointer',
                 }}
               >
                 {letter}

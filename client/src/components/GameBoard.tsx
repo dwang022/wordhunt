@@ -22,7 +22,6 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
-  // Compute grid bounds — the whole grid rect divided into 4x4 equal zones
   const computeGrid = useCallback(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
@@ -33,7 +32,6 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
       cellW: r.width / 4,
       cellH: r.height / 4,
     };
-    // Also keep centers for drawing lines
     tileCenters.current = tileRefs.current.map(el => {
       if (!el) return { x: 0, y: 0 };
       const tr = el.getBoundingClientRect();
@@ -47,20 +45,16 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     return () => { clearTimeout(t); window.removeEventListener('resize', computeGrid); };
   }, [computeGrid]);
 
-  // Map any screen point to a tile index (0-15) using zone grid
-  // The entire grid surface maps to exactly one tile — no dead zones at all
   const getTileFromPoint = useCallback((x: number, y: number): number => {
     const g = gridBounds.current;
     if (!g) return -1;
-    // Clamp to grid bounds so edge tiles are reachable even if finger is outside
-    const col = Math.min(3, Math.max(0, Math.floor((x - g.left) / g.cellW)));
-    const row = Math.min(3, Math.max(0, Math.floor((y - g.top) / g.cellH)));
-    // Only return a valid tile if we're actually within the grid area (with generous margin)
-    const margin = g.cellW * 0.3;
+    const margin = g.cellW * 0.35;
     if (
       x < g.left - margin || x > g.left + g.cellW * 4 + margin ||
       y < g.top - margin || y > g.top + g.cellH * 4 + margin
     ) return -1;
+    const col = Math.min(3, Math.max(0, Math.floor((x - g.left) / g.cellW)));
+    const row = Math.min(3, Math.max(0, Math.floor((y - g.top) / g.cellH)));
     return row * 4 + col;
   }, []);
 
@@ -88,22 +82,18 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     }
   }, []);
 
-  // Try to extend or backtrack path with a new tile
   const processTile = useCallback((tile: number): boolean => {
     const prev = pathRef.current;
     if (prev.length === 0) return false;
     const last = prev[prev.length - 1];
     if (tile === last) return false;
-
     // Backtrack
     if (prev.length >= 2 && tile === prev[prev.length - 2]) {
       pathRef.current = prev.slice(0, -1);
       return true;
     }
-
     if (prev.includes(tile)) return false;
     if (!isAdjacent(last, tile)) return false;
-
     pathRef.current = [...prev, tile];
     return true;
   }, []);
@@ -113,7 +103,10 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     computeGrid();
     const tile = getTileFromPoint(x, y);
     if (tile < 0) return;
+
     dragging.current = true;
+    // Critical: set lastPos to EXACTLY the touch start point
+    // so the first moveDrag interpolates FROM here, not losing the start tile
     lastPos.current = { x, y };
     pathRef.current = [tile];
     setPath([tile]);
@@ -123,14 +116,18 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
 
-    const from = lastPos.current || { x, y };
+    // Always interpolate from lastPos to current point
+    // This guarantees the start tile is never skipped on the first move
+    const from = lastPos.current!;
     lastPos.current = { x, y };
 
     const dx = x - from.x;
     const dy = y - from.y;
     const dist = Math.hypot(dx, dy);
 
-    // Interpolate every 4px — fine enough to catch all diagonal tiles
+    if (dist < 1) return; // ignore micro-movements
+
+    // Sample every 4px along the swipe line
     const steps = Math.max(1, Math.ceil(dist / 4));
     let changed = false;
 
@@ -229,7 +226,6 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         </div>
       </div>
 
-      {/* Grid takes full width so each tile zone is as large as possible */}
       <div
         ref={wrapperRef}
         style={{

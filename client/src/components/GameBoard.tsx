@@ -16,17 +16,46 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   const wrapperRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const pathRef = useRef<number[]>([]);
+  // Store tile centers for fast nearest-tile lookup
+  const tileCenters = useRef<{ x: number; y: number }[]>([]);
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
-  const getTileAt = useCallback((x: number, y: number): number => {
-    for (let i = 0; i < 16; i++) {
-      const el = tileRefs.current[i];
-      if (!el) continue;
+  // Compute and cache tile centers (called on mount + resize)
+  const computeTileCenters = useCallback(() => {
+    tileCenters.current = tileRefs.current.map(el => {
+      if (!el) return { x: 0, y: 0 };
       const r = el.getBoundingClientRect();
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return i;
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    });
+  }, []);
+
+  useEffect(() => {
+    computeTileCenters();
+    window.addEventListener('resize', computeTileCenters);
+    return () => window.removeEventListener('resize', computeTileCenters);
+  }, [computeTileCenters]);
+
+  // Find nearest tile within snap radius
+  const getNearestTile = useCallback((x: number, y: number): number => {
+    // Snap radius = roughly 60% of tile size
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return -1;
+    const tileSize = wrapper.getBoundingClientRect().width / 4;
+    const snapRadius = tileSize * 0.75;
+
+    let best = -1;
+    let bestDist = snapRadius;
+    for (let i = 0; i < 16; i++) {
+      const c = tileCenters.current[i];
+      if (!c) continue;
+      const dist = Math.hypot(x - c.x, y - c.y);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
     }
-    return -1;
+    return best;
   }, []);
 
   const drawPathFromRef = useCallback(() => {
@@ -37,35 +66,36 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     const wr = wrapper.getBoundingClientRect();
     const p = pathRef.current;
     for (let i = 1; i < p.length; i++) {
-      const a = tileRefs.current[p[i - 1]]?.getBoundingClientRect();
-      const b = tileRefs.current[p[i]]?.getBoundingClientRect();
+      const a = tileCenters.current[p[i - 1]];
+      const b = tileCenters.current[p[i]];
       if (!a || !b) continue;
       const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', String(a.left - wr.left + a.width / 2));
-      line.setAttribute('y1', String(a.top - wr.top + a.height / 2));
-      line.setAttribute('x2', String(b.left - wr.left + b.width / 2));
-      line.setAttribute('y2', String(b.top - wr.top + b.height / 2));
+      line.setAttribute('x1', String(a.x - wr.left));
+      line.setAttribute('y1', String(a.y - wr.top));
+      line.setAttribute('x2', String(b.x - wr.left));
+      line.setAttribute('y2', String(b.y - wr.top));
       line.setAttribute('stroke', '#3b82f6');
       line.setAttribute('stroke-width', '5');
       line.setAttribute('stroke-linecap', 'round');
-      line.setAttribute('opacity', '0.7');
+      line.setAttribute('opacity', '0.75');
       svg.appendChild(line);
     }
   }, []);
 
   const startDrag = useCallback((x: number, y: number) => {
     if (!active) return;
-    const i = getTileAt(x, y);
+    computeTileCenters(); // refresh in case of scroll/layout shift
+    const i = getNearestTile(x, y);
     if (i < 0) return;
     dragging.current = true;
     pathRef.current = [i];
     setPath([i]);
     drawPathFromRef();
-  }, [active, getTileAt, drawPathFromRef]);
+  }, [active, getNearestTile, drawPathFromRef, computeTileCenters]);
 
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
-    const i = getTileAt(x, y);
+    const i = getNearestTile(x, y);
     if (i < 0) return;
 
     const prev = pathRef.current;
@@ -73,11 +103,11 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     const last = prev[prev.length - 1];
     if (i === last) return;
 
-    // Backtrack
+    // Backtrack if moving back to second-to-last tile
     if (prev.length >= 2 && i === prev[prev.length - 2]) {
       const next = prev.slice(0, -1);
       pathRef.current = next;
-      setPath(next);
+      setPath([...next]);
       drawPathFromRef();
       return;
     }
@@ -89,7 +119,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     pathRef.current = next;
     setPath(next);
     drawPathFromRef();
-  }, [active, getTileAt, drawPathFromRef]);
+  }, [active, getNearestTile, drawPathFromRef]);
 
   const endDrag = useCallback(() => {
     if (!dragging.current) return;
@@ -114,13 +144,14 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     if (svgRef.current) svgRef.current.innerHTML = '';
   }, [board, foundWords, onWordFound, onWordAttempt]);
 
-  // Attach touch events directly to DOM to use passive:false (prevents scroll)
+  // Touch events — passive:false is critical to block iOS scroll during swipe
   useEffect(() => {
     const el = wrapperRef.current;
     if (!el) return;
 
     const onTouchStart = (e: TouchEvent) => {
-      e.preventDefault(); // critical — stops page scroll during swipe
+      e.preventDefault();
+      computeTileCenters();
       const t = e.touches[0];
       startDrag(t.clientX, t.clientY);
     };
@@ -149,7 +180,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
       el.removeEventListener('touchend', onTouchEnd);
       el.removeEventListener('touchcancel', onTouchCancel);
     };
-  }, [startDrag, moveDrag, endDrag]);
+  }, [startDrag, moveDrag, endDrag, computeTileCenters]);
 
   const wordValid = currentWord.length >= 3 && isWord(currentWord);
   const wordAlready = foundWords.has(currentWord);
@@ -183,25 +214,27 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
             letterSpacing: 4,
             minWidth: 140,
             textAlign: 'center',
-            transition: 'all 0.1s',
+            transition: 'background 0.08s, border-color 0.08s, color 0.08s',
           }}
         >
           {currentWord.toUpperCase() || '—'}
         </div>
       </div>
 
-      {/* Grid — touch-action:none is critical to stop iOS scroll stealing */}
+      {/* Grid */}
       <div
         ref={wrapperRef}
         style={{
           position: 'relative',
-          touchAction: 'none',       /* prevents scroll hijack on iOS */
+          touchAction: 'none',
           userSelect: 'none',
           WebkitUserSelect: 'none',
           width: '100%',
-          maxWidth: 380,
+          maxWidth: 400,
+          // Larger hit area padding so edge tiles are easier to start on
+          padding: 4,
         }}
-        onMouseDown={e => startDrag(e.clientX, e.clientY)}
+        onMouseDown={e => { computeTileCenters(); startDrag(e.clientX, e.clientY); }}
         onMouseMove={e => { if (dragging.current) moveDrag(e.clientX, e.clientY); }}
         onMouseUp={endDrag}
         onMouseLeave={endDrag}
@@ -217,7 +250,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         <div style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(4, 1fr)',
-          gap: 6,
+          gap: 8,
           width: '100%',
         }}>
           {board.map((letter, i) => {
@@ -230,18 +263,23 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
                 ref={el => { tileRefs.current[i] = el; }}
                 style={{
                   aspectRatio: '1',
-                  background: isActive ? 'var(--tile-active)' : isInPath ? '#1e3a5f' : 'var(--tile-bg)',
+                  background: isActive
+                    ? 'var(--tile-active)'
+                    : isInPath
+                    ? '#1e3a5f'
+                    : 'var(--tile-bg)',
                   border: `2px solid ${isActive ? '#3b82f6' : isInPath ? '#2563eb' : 'var(--tile-border)'}`,
-                  borderRadius: 12,
+                  borderRadius: 14,
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   fontFamily: "'Bebas Neue', sans-serif",
-                  fontSize: 'clamp(24px, 7vw, 34px)',
+                  // Bigger letters = easier to see while swiping
+                  fontSize: 'clamp(26px, 8vw, 36px)',
                   color: isActive ? '#fff' : isInPath ? 'var(--blue)' : 'var(--text)',
-                  transform: isActive ? 'scale(1.1)' : 'scale(1)',
-                  transition: 'transform 0.08s, background 0.08s, border-color 0.08s',
-                  boxShadow: isActive ? '0 0 16px var(--tile-glow)' : 'none',
+                  transform: isActive ? 'scale(1.12)' : 'scale(1)',
+                  transition: 'transform 0.07s, background 0.07s, border-color 0.07s',
+                  boxShadow: isActive ? '0 0 20px var(--tile-glow)' : 'none',
                   zIndex: isActive ? 2 : 1,
                   position: 'relative',
                   cursor: 'pointer',

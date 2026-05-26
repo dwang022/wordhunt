@@ -17,35 +17,51 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   const svgRef = useRef<SVGSVGElement>(null);
   const pathRef = useRef<number[]>([]);
   const tileCenters = useRef<{ x: number; y: number }[]>([]);
+  const gridBounds = useRef<{ left: number; top: number; cellW: number; cellH: number } | null>(null);
   const lastPos = useRef<{ x: number; y: number } | null>(null);
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
-  const computeTileCenters = useCallback(() => {
+  // Compute grid bounds — the whole grid rect divided into 4x4 equal zones
+  const computeGrid = useCallback(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    const r = wrapper.getBoundingClientRect();
+    gridBounds.current = {
+      left: r.left,
+      top: r.top,
+      cellW: r.width / 4,
+      cellH: r.height / 4,
+    };
+    // Also keep centers for drawing lines
     tileCenters.current = tileRefs.current.map(el => {
       if (!el) return { x: 0, y: 0 };
-      const r = el.getBoundingClientRect();
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      const tr = el.getBoundingClientRect();
+      return { x: tr.left + tr.width / 2, y: tr.top + tr.height / 2 };
     });
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(computeTileCenters, 80);
-    window.addEventListener('resize', computeTileCenters);
-    return () => { clearTimeout(t); window.removeEventListener('resize', computeTileCenters); };
-  }, [computeTileCenters]);
+    const t = setTimeout(computeGrid, 80);
+    window.addEventListener('resize', computeGrid);
+    return () => { clearTimeout(t); window.removeEventListener('resize', computeGrid); };
+  }, [computeGrid]);
 
-  // Simple nearest tile — no direction bias, just pure distance
-  const getNearestTile = useCallback((x: number, y: number): number => {
-    let best = -1;
-    let bestDist = Infinity;
-    for (let i = 0; i < 16; i++) {
-      const c = tileCenters.current[i];
-      if (!c) continue;
-      const dist = Math.hypot(x - c.x, y - c.y);
-      if (dist < bestDist) { bestDist = dist; best = i; }
-    }
-    return best;
+  // Map any screen point to a tile index (0-15) using zone grid
+  // The entire grid surface maps to exactly one tile — no dead zones at all
+  const getTileFromPoint = useCallback((x: number, y: number): number => {
+    const g = gridBounds.current;
+    if (!g) return -1;
+    // Clamp to grid bounds so edge tiles are reachable even if finger is outside
+    const col = Math.min(3, Math.max(0, Math.floor((x - g.left) / g.cellW)));
+    const row = Math.min(3, Math.max(0, Math.floor((y - g.top) / g.cellH)));
+    // Only return a valid tile if we're actually within the grid area (with generous margin)
+    const margin = g.cellW * 0.3;
+    if (
+      x < g.left - margin || x > g.left + g.cellW * 4 + margin ||
+      y < g.top - margin || y > g.top + g.cellH * 4 + margin
+    ) return -1;
+    return row * 4 + col;
   }, []);
 
   const drawPathFromRef = useCallback(() => {
@@ -72,41 +88,37 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     }
   }, []);
 
-  // Process a single point — try to add nearest tile to path
-  const processPoint = useCallback((x: number, y: number) => {
-    const nearest = getNearestTile(x, y);
-    if (nearest < 0) return false;
-
+  // Try to extend or backtrack path with a new tile
+  const processTile = useCallback((tile: number): boolean => {
     const prev = pathRef.current;
     if (prev.length === 0) return false;
     const last = prev[prev.length - 1];
-
-    if (nearest === last) return false;
+    if (tile === last) return false;
 
     // Backtrack
-    if (prev.length >= 2 && nearest === prev[prev.length - 2]) {
+    if (prev.length >= 2 && tile === prev[prev.length - 2]) {
       pathRef.current = prev.slice(0, -1);
       return true;
     }
 
-    if (prev.includes(nearest)) return false;
-    if (!isAdjacent(last, nearest)) return false;
+    if (prev.includes(tile)) return false;
+    if (!isAdjacent(last, tile)) return false;
 
-    pathRef.current = [...prev, nearest];
+    pathRef.current = [...prev, tile];
     return true;
-  }, [getNearestTile]);
+  }, []);
 
   const startDrag = useCallback((x: number, y: number) => {
     if (!active) return;
-    computeTileCenters();
-    const nearest = getNearestTile(x, y);
-    if (nearest < 0) return;
+    computeGrid();
+    const tile = getTileFromPoint(x, y);
+    if (tile < 0) return;
     dragging.current = true;
     lastPos.current = { x, y };
-    pathRef.current = [nearest];
-    setPath([nearest]);
+    pathRef.current = [tile];
+    setPath([tile]);
     drawPathFromRef();
-  }, [active, getNearestTile, drawPathFromRef, computeTileCenters]);
+  }, [active, getTileFromPoint, drawPathFromRef, computeGrid]);
 
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
@@ -118,23 +130,23 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     const dy = y - from.y;
     const dist = Math.hypot(dx, dy);
 
-    // Interpolate along the movement line — sample every 6px
-    // This is what makes fast diagonal swipes work
-    const steps = Math.max(1, Math.ceil(dist / 6));
+    // Interpolate every 4px — fine enough to catch all diagonal tiles
+    const steps = Math.max(1, Math.ceil(dist / 4));
     let changed = false;
 
     for (let s = 1; s <= steps; s++) {
       const t = s / steps;
       const sx = from.x + dx * t;
       const sy = from.y + dy * t;
-      if (processPoint(sx, sy)) changed = true;
+      const tile = getTileFromPoint(sx, sy);
+      if (tile >= 0 && processTile(tile)) changed = true;
     }
 
     if (changed) {
       setPath([...pathRef.current]);
       drawPathFromRef();
     }
-  }, [active, processPoint, drawPathFromRef]);
+  }, [active, getTileFromPoint, processTile, drawPathFromRef]);
 
   const endDrag = useCallback(() => {
     if (!dragging.current) return;
@@ -165,7 +177,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     if (!el) return;
     const onTouchStart = (e: TouchEvent) => {
       e.preventDefault();
-      computeTileCenters();
+      computeGrid();
       const t = e.touches[0];
       startDrag(t.clientX, t.clientY);
     };
@@ -187,7 +199,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
       el.removeEventListener('touchend', onTouchEnd);
       el.removeEventListener('touchcancel', onTouchCancel);
     };
-  }, [startDrag, moveDrag, endDrag, computeTileCenters]);
+  }, [startDrag, moveDrag, endDrag, computeGrid]);
 
   const wordValid = currentWord.length >= 3 && isWord(currentWord);
   const wordAlready = foundWords.has(currentWord);
@@ -217,14 +229,16 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         </div>
       </div>
 
+      {/* Grid takes full width so each tile zone is as large as possible */}
       <div
         ref={wrapperRef}
         style={{
           position: 'relative', touchAction: 'none',
           userSelect: 'none', WebkitUserSelect: 'none',
-          width: '100%', maxWidth: 420, padding: 2,
+          width: '100%',
+          maxWidth: '100%',
         }}
-        onMouseDown={e => { computeTileCenters(); startDrag(e.clientX, e.clientY); }}
+        onMouseDown={e => { computeGrid(); startDrag(e.clientX, e.clientY); }}
         onMouseMove={e => { if (dragging.current) moveDrag(e.clientX, e.clientY); }}
         onMouseUp={endDrag}
         onMouseLeave={endDrag}
@@ -233,7 +247,12 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
           position: 'absolute', top: 0, left: 0,
           width: '100%', height: '100%', pointerEvents: 'none', zIndex: 1,
         }} />
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, width: '100%' }}>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(4, 1fr)',
+          gap: 5,
+          width: '100%',
+        }}>
           {board.map((letter, i) => {
             const isActive = path[path.length - 1] === i;
             const isInPath = path.includes(i) && !isActive;
@@ -242,12 +261,12 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
                 aspectRatio: '1',
                 background: isActive ? 'var(--tile-active)' : isInPath ? '#1e3a5f' : 'var(--tile-bg)',
                 border: `2px solid ${isActive ? '#3b82f6' : isInPath ? '#2563eb' : 'var(--tile-border)'}`,
-                borderRadius: 14,
+                borderRadius: 12,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 fontFamily: "'Bebas Neue', sans-serif",
                 fontSize: 'clamp(28px, 8.5vw, 38px)',
                 color: isActive ? '#fff' : isInPath ? 'var(--blue)' : 'var(--text)',
-                transform: isActive ? 'scale(1.12)' : 'scale(1)',
+                transform: isActive ? 'scale(1.08)' : 'scale(1)',
                 transition: 'transform 0.06s, background 0.06s, border-color 0.06s',
                 boxShadow: isActive ? '0 0 20px var(--tile-glow)' : 'none',
                 zIndex: isActive ? 2 : 1, position: 'relative',

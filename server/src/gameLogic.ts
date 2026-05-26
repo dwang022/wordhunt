@@ -100,9 +100,13 @@ export function calcEloChange(opts: {
   const { playerElo, pct, mode, opponentElo, won } = opts;
 
   if (mode === 'solo') {
-    const expected = Math.min(0.85, 0.15 + playerElo / 4000);
-    const delta = Math.round(K * (pct - expected) * 2.5);
-    return Math.max(-30, Math.min(50, delta));
+    // Realistic expectations:
+    // 1200 player expected to find ~20% of board
+    // 1500 player expected to find ~30%
+    // 1800 player expected to find ~40%
+    const expected = Math.min(0.45, 0.10 + playerElo / 8000);
+    const delta = Math.round(K * (pct - expected) * 3);
+    return Math.max(-20, Math.min(40, delta));
   } else {
     const oppElo = opponentElo ?? playerElo;
     const expected = 1 / (1 + Math.pow(10, (oppElo - playerElo) / 400));
@@ -110,6 +114,7 @@ export function calcEloChange(opts: {
     return Math.round(K * (result - expected));
   }
 }
+
 
 export function getRank(elo: number): { name: string; icon: string; min: number; max: number } {
   if (elo < 1000) return { name: 'Novice',      icon: '🔰', min: 0,    max: 999  };

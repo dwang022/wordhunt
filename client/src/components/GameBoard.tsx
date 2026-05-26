@@ -17,9 +17,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
   const svgRef = useRef<SVGSVGElement>(null);
   const pathRef = useRef<number[]>([]);
   const tileCenters = useRef<{ x: number; y: number }[]>([]);
-  const lastTouchPos = useRef<{ x: number; y: number } | null>(null);
-  // Track recent movement direction for directional bias
-  const moveDir = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const lastPos = useRef<{ x: number; y: number } | null>(null);
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
@@ -37,66 +35,15 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     return () => { clearTimeout(t); window.removeEventListener('resize', computeTileCenters); };
   }, [computeTileCenters]);
 
-  // Core snapping function — direction-aware
-  // For each candidate tile, compute a weighted distance that accounts for:
-  // 1. Raw distance to tile center
-  // 2. Whether the tile is in the direction the finger is moving
-  // 3. Whether the tile is adjacent to the last selected tile
-  const getBestTile = useCallback((
-    x: number,
-    y: number,
-    fromIdx: number,
-    dirX: number,
-    dirY: number
-  ): number => {
-    const wrapper = wrapperRef.current;
-    if (!wrapper) return -1;
-    const tileSize = wrapper.getBoundingClientRect().width / 4;
-
-    // Base snap radius — generous enough for diagonals
-    // Diagonal distance between adjacent tiles = tileSize * sqrt(2) ≈ 1.41
-    // So we need radius > half that to reliably catch diagonals
-    const snapRadius = tileSize * 0.95;
-
-    const hasDirInfo = dirX !== 0 || dirY !== 0;
-    const dirLen = Math.hypot(dirX, dirY) || 1;
-    const ndx = dirX / dirLen;
-    const ndy = dirY / dirLen;
-
+  // Simple nearest tile — no direction bias, just pure distance
+  const getNearestTile = useCallback((x: number, y: number): number => {
     let best = -1;
-    let bestScore = Infinity;
-
+    let bestDist = Infinity;
     for (let i = 0; i < 16; i++) {
-      if (i === fromIdx) continue;
       const c = tileCenters.current[i];
       if (!c) continue;
-
-      const dx = c.x - x;
-      const dy = c.y - y;
-      const dist = Math.hypot(dx, dy);
-      if (dist > snapRadius) continue;
-
-      // Must be adjacent to last tile if we have one
-      if (fromIdx >= 0 && !isAdjacent(fromIdx, i)) continue;
-
-      let score = dist;
-
-      if (hasDirInfo && dist > 0) {
-        // Dot product: how aligned is this tile with movement direction?
-        // Range: -1 (opposite) to 1 (perfect alignment)
-        const dot = (dx / dist) * ndx + (dy / dist) * ndy;
-        // Heavily reward tiles in the direction of movement
-        // dot=1 (aligned) → multiply by 0.4 (much closer effectively)
-        // dot=0 (perpendicular) → multiply by 1.0 (normal)
-        // dot=-1 (opposite) → multiply by 2.0 (effectively push away)
-        const dirFactor = 1.0 - dot * 0.6;
-        score = dist * dirFactor;
-      }
-
-      if (score < bestScore) {
-        bestScore = score;
-        best = i;
-      }
+      const dist = Math.hypot(x - c.x, y - c.y);
+      if (dist < bestDist) { bestDist = dist; best = i; }
     }
     return best;
   }, []);
@@ -125,97 +72,74 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     }
   }, []);
 
+  // Process a single point — try to add nearest tile to path
+  const processPoint = useCallback((x: number, y: number) => {
+    const nearest = getNearestTile(x, y);
+    if (nearest < 0) return false;
+
+    const prev = pathRef.current;
+    if (prev.length === 0) return false;
+    const last = prev[prev.length - 1];
+
+    if (nearest === last) return false;
+
+    // Backtrack
+    if (prev.length >= 2 && nearest === prev[prev.length - 2]) {
+      pathRef.current = prev.slice(0, -1);
+      return true;
+    }
+
+    if (prev.includes(nearest)) return false;
+    if (!isAdjacent(last, nearest)) return false;
+
+    pathRef.current = [...prev, nearest];
+    return true;
+  }, [getNearestTile]);
+
   const startDrag = useCallback((x: number, y: number) => {
     if (!active) return;
     computeTileCenters();
-    // Find starting tile — no direction bias at start
-    const wrapper = wrapperRef.current;
-    if (!wrapper) return;
-    const tileSize = wrapper.getBoundingClientRect().width / 4;
-    const snapRadius = tileSize * 0.95;
-    let best = -1, bestDist = snapRadius;
-    for (let i = 0; i < 16; i++) {
-      const c = tileCenters.current[i];
-      if (!c) continue;
-      const dist = Math.hypot(x - c.x, y - c.y);
-      if (dist < bestDist) { bestDist = dist; best = i; }
-    }
-    if (best < 0) return;
+    const nearest = getNearestTile(x, y);
+    if (nearest < 0) return;
     dragging.current = true;
-    lastTouchPos.current = { x, y };
-    moveDir.current = { x: 0, y: 0 };
-    pathRef.current = [best];
-    setPath([best]);
+    lastPos.current = { x, y };
+    pathRef.current = [nearest];
+    setPath([nearest]);
     drawPathFromRef();
-  }, [active, drawPathFromRef, computeTileCenters]);
+  }, [active, getNearestTile, drawPathFromRef, computeTileCenters]);
 
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
 
-    const from = lastTouchPos.current;
-    if (!from) { lastTouchPos.current = { x, y }; return; }
+    const from = lastPos.current || { x, y };
+    lastPos.current = { x, y };
 
-    const rawDx = x - from.x;
-    const rawDy = y - from.y;
-    const moved = Math.hypot(rawDx, rawDy);
+    const dx = x - from.x;
+    const dy = y - from.y;
+    const dist = Math.hypot(dx, dy);
 
-    // Update smoothed direction (exponential moving average)
-    if (moved > 1) {
-      const alpha = 0.5;
-      moveDir.current = {
-        x: moveDir.current.x * (1 - alpha) + (rawDx / moved) * alpha,
-        y: moveDir.current.y * (1 - alpha) + (rawDy / moved) * alpha,
-      };
-    }
-
-    lastTouchPos.current = { x, y };
-
-    // Interpolate between last and current position
-    // Fine steps (every 8px) to catch all tiles even at fast swipe speed
-    const wrapper = wrapperRef.current;
-    if (!wrapper) return;
-    const stepSize = 8;
-    const steps = Math.max(1, Math.ceil(moved / stepSize));
-
+    // Interpolate along the movement line — sample every 6px
+    // This is what makes fast diagonal swipes work
+    const steps = Math.max(1, Math.ceil(dist / 6));
     let changed = false;
 
     for (let s = 1; s <= steps; s++) {
       const t = s / steps;
-      const sx = from.x + rawDx * t;
-      const sy = from.y + rawDy * t;
-
-      const prev = pathRef.current;
-      const lastIdx = prev[prev.length - 1];
-
-      const candidate = getBestTile(sx, sy, lastIdx, moveDir.current.x, moveDir.current.y);
-
-      if (candidate < 0 || candidate === lastIdx) continue;
-
-      // Backtrack
-      if (prev.length >= 2 && candidate === prev[prev.length - 2]) {
-        pathRef.current = prev.slice(0, -1);
-        changed = true;
-        continue;
-      }
-
-      if (prev.includes(candidate)) continue;
-      if (!isAdjacent(lastIdx, candidate)) continue;
-
-      pathRef.current = [...pathRef.current, candidate];
-      changed = true;
+      const sx = from.x + dx * t;
+      const sy = from.y + dy * t;
+      if (processPoint(sx, sy)) changed = true;
     }
 
     if (changed) {
       setPath([...pathRef.current]);
       drawPathFromRef();
     }
-  }, [active, getBestTile, drawPathFromRef]);
+  }, [active, processPoint, drawPathFromRef]);
 
   const endDrag = useCallback(() => {
     if (!dragging.current) return;
     dragging.current = false;
-    lastTouchPos.current = null;
-    moveDir.current = { x: 0, y: 0 };
+    lastPos.current = null;
 
     const p = pathRef.current;
     const word = p.map(i => board[i].toLowerCase()).join('');

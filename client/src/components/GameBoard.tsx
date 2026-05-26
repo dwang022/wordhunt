@@ -9,77 +9,111 @@ interface Props {
   active: boolean;
 }
 
+// Tile size in px — set once on mount based on screen width
+const GRID_COLS = 4;
+const GAP = 8;
+
 export default function GameBoard({ board, onWordFound, onWordAttempt, foundWords, active }: Props) {
   const [path, setPath] = useState<number[]>([]);
+  const [tileSize, setTileSize] = useState(80);
   const dragging = useRef(false);
-  const tileRefs = useRef<(HTMLDivElement | null)[]>([]);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const pathRef = useRef<number[]>([]);
-  const tileCenters = useRef<{ x: number; y: number }[]>([]);
-  const gridBounds = useRef<{ left: number; top: number; cellW: number; cellH: number } | null>(null);
+  const tileSizeRef = useRef(80);
+  const gridOrigin = useRef({ x: 0, y: 0 });
   const lastPos = useRef<{ x: number; y: number } | null>(null);
+  const animRef = useRef<number>(0);
 
   const currentWord = path.map(i => board[i].toLowerCase()).join('');
 
-  const computeGrid = useCallback(() => {
+  // Compute tile size from wrapper width
+  const computeLayout = useCallback(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
-    const r = wrapper.getBoundingClientRect();
-    gridBounds.current = {
-      left: r.left,
-      top: r.top,
-      cellW: r.width / 4,
-      cellH: r.height / 4,
-    };
-    tileCenters.current = tileRefs.current.map(el => {
-      if (!el) return { x: 0, y: 0 };
-      const tr = el.getBoundingClientRect();
-      return { x: tr.left + tr.width / 2, y: tr.top + tr.height / 2 };
-    });
+    const w = wrapper.getBoundingClientRect().width;
+    const size = Math.floor((w - GAP * (GRID_COLS - 1)) / GRID_COLS);
+    tileSizeRef.current = size;
+    setTileSize(size);
+    const rect = wrapper.getBoundingClientRect();
+    gridOrigin.current = { x: rect.left, y: rect.top };
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(computeGrid, 80);
-    window.addEventListener('resize', computeGrid);
-    return () => { clearTimeout(t); window.removeEventListener('resize', computeGrid); };
-  }, [computeGrid]);
+    const t = setTimeout(computeLayout, 60);
+    window.addEventListener('resize', computeLayout);
+    return () => { clearTimeout(t); window.removeEventListener('resize', computeLayout); };
+  }, [computeLayout]);
 
-  const getTileFromPoint = useCallback((x: number, y: number): number => {
-    const g = gridBounds.current;
-    if (!g) return -1;
-    const margin = g.cellW * 0.35;
-    if (
-      x < g.left - margin || x > g.left + g.cellW * 4 + margin ||
-      y < g.top - margin || y > g.top + g.cellH * 4 + margin
-    ) return -1;
-    const col = Math.min(3, Math.max(0, Math.floor((x - g.left) / g.cellW)));
-    const row = Math.min(3, Math.max(0, Math.floor((y - g.top) / g.cellH)));
-    return row * 4 + col;
+  // Convert screen point → tile index using expanded hit zones
+  // Each tile's hit zone extends BEYOND its visual boundary by `expand` px
+  // so neighboring zones overlap — this eliminates dead zones entirely
+  const getTile = useCallback((screenX: number, screenY: number): number => {
+    const origin = gridOrigin.current;
+    const size = tileSizeRef.current;
+    const step = size + GAP; // distance between tile centers
+
+    // Map screen coords to grid-local coords
+    const lx = screenX - origin.x;
+    const ly = screenY - origin.y;
+
+    // Find the nearest tile center
+    // Each tile center is at: col * step + size/2, row * step + size/2
+    let best = -1;
+    let bestDist = Infinity;
+
+    for (let row = 0; row < 4; row++) {
+      for (let col = 0; col < 4; col++) {
+        const cx = col * step + size / 2;
+        const cy = row * step + size / 2;
+        const dist = Math.hypot(lx - cx, ly - cy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = row * 4 + col;
+        }
+      }
+    }
+
+    // Only return tile if within generous range (step * 0.75 catches all diagonals)
+    // step * 0.75 = 75% of the distance between tile centers
+    // For a 80px tile with 8px gap = 88px step → range = 66px
+    // Diagonal distance between adjacent centers = step * sqrt(2) ≈ 124px
+    // So we use a bigger threshold for actual detection: step * 0.9
+    if (bestDist > step * 0.9) return -1;
+    return best;
   }, []);
 
-  const drawPathFromRef = useCallback(() => {
-    const svg = svgRef.current;
+  // Draw path lines on canvas overlay
+  const drawCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
     const wrapper = wrapperRef.current;
-    if (!svg || !wrapper) return;
-    svg.innerHTML = '';
-    const wr = wrapper.getBoundingClientRect();
+    if (!canvas || !wrapper) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const size = tileSizeRef.current;
+    const step = size + GAP;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
     const p = pathRef.current;
-    for (let i = 1; i < p.length; i++) {
-      const a = tileCenters.current[p[i - 1]];
-      const b = tileCenters.current[p[i]];
-      if (!a || !b) continue;
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', String(a.x - wr.left));
-      line.setAttribute('y1', String(a.y - wr.top));
-      line.setAttribute('x2', String(b.x - wr.left));
-      line.setAttribute('y2', String(b.y - wr.top));
-      line.setAttribute('stroke', '#3b82f6');
-      line.setAttribute('stroke-width', '6');
-      line.setAttribute('stroke-linecap', 'round');
-      line.setAttribute('opacity', '0.85');
-      svg.appendChild(line);
+    if (p.length < 2) return;
+
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 6;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+
+    for (let i = 0; i < p.length; i++) {
+      const col = p[i] % 4;
+      const row = Math.floor(p[i] / 4);
+      const cx = col * step + size / 2;
+      const cy = row * step + size / 2;
+      if (i === 0) ctx.moveTo(cx, cy);
+      else ctx.lineTo(cx, cy);
     }
+    ctx.stroke();
   }, []);
 
   const processTile = useCallback((tile: number): boolean => {
@@ -100,55 +134,56 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
 
   const startDrag = useCallback((x: number, y: number) => {
     if (!active) return;
-    computeGrid();
-    const tile = getTileFromPoint(x, y);
+    computeLayout();
+
+    // Refresh grid origin every drag start (handles scroll/layout changes)
+    const wrapper = wrapperRef.current;
+    if (wrapper) gridOrigin.current = { x: wrapper.getBoundingClientRect().left, y: wrapper.getBoundingClientRect().top };
+
+    const tile = getTile(x, y);
     if (tile < 0) return;
 
     dragging.current = true;
-    // Critical: set lastPos to EXACTLY the touch start point
-    // so the first moveDrag interpolates FROM here, not losing the start tile
     lastPos.current = { x, y };
     pathRef.current = [tile];
     setPath([tile]);
-    drawPathFromRef();
-  }, [active, getTileFromPoint, drawPathFromRef, computeGrid]);
+    drawCanvas();
+  }, [active, getTile, drawCanvas, computeLayout]);
 
   const moveDrag = useCallback((x: number, y: number) => {
     if (!dragging.current || !active) return;
 
-    // Always interpolate from lastPos to current point
-    // This guarantees the start tile is never skipped on the first move
     const from = lastPos.current!;
     lastPos.current = { x, y };
 
     const dx = x - from.x;
     const dy = y - from.y;
     const dist = Math.hypot(dx, dy);
+    if (dist < 0.5) return;
 
-    if (dist < 1) return; // ignore micro-movements
-
-    // Sample every 4px along the swipe line
-    const steps = Math.max(1, Math.ceil(dist / 4));
+    // Sample every 3px — very fine to catch all diagonal crossings
+    const steps = Math.max(1, Math.ceil(dist / 3));
     let changed = false;
 
     for (let s = 1; s <= steps; s++) {
       const t = s / steps;
-      const sx = from.x + dx * t;
-      const sy = from.y + dy * t;
-      const tile = getTileFromPoint(sx, sy);
+      const tile = getTile(from.x + dx * t, from.y + dy * t);
       if (tile >= 0 && processTile(tile)) changed = true;
     }
 
     if (changed) {
       setPath([...pathRef.current]);
-      drawPathFromRef();
+      // Use rAF to batch canvas redraws
+      cancelAnimationFrame(animRef.current);
+      animRef.current = requestAnimationFrame(drawCanvas);
     }
-  }, [active, getTileFromPoint, processTile, drawPathFromRef]);
+  }, [active, getTile, processTile, drawCanvas]);
 
   const endDrag = useCallback(() => {
     if (!dragging.current) return;
     dragging.current = false;
     lastPos.current = null;
+    cancelAnimationFrame(animRef.current);
 
     const p = pathRef.current;
     const word = p.map(i => board[i].toLowerCase()).join('');
@@ -166,15 +201,32 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
 
     pathRef.current = [];
     setPath([]);
-    if (svgRef.current) svgRef.current.innerHTML = '';
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
   }, [board, foundWords, onWordFound, onWordAttempt]);
+
+  // Resize canvas when tileSize changes
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrapper = wrapperRef.current;
+    if (!canvas || !wrapper) return;
+    const w = wrapper.getBoundingClientRect().width;
+    const h = tileSize * 4 + GAP * 3;
+    canvas.width = w;
+    canvas.height = h;
+  }, [tileSize]);
 
   useEffect(() => {
     const el = wrapperRef.current;
     if (!el) return;
     const onTouchStart = (e: TouchEvent) => {
       e.preventDefault();
-      computeGrid();
+      const wrapper = wrapperRef.current;
+      if (wrapper) gridOrigin.current = { x: wrapper.getBoundingClientRect().left, y: wrapper.getBoundingClientRect().top };
+      computeLayout();
       const t = e.touches[0];
       startDrag(t.clientX, t.clientY);
     };
@@ -196,7 +248,7 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
       el.removeEventListener('touchend', onTouchEnd);
       el.removeEventListener('touchcancel', onTouchCancel);
     };
-  }, [startDrag, moveDrag, endDrag, computeGrid]);
+  }, [startDrag, moveDrag, endDrag, computeLayout]);
 
   const wordValid = currentWord.length >= 3 && isWord(currentWord);
   const wordAlready = foundWords.has(currentWord);
@@ -213,8 +265,11 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
     bubbleStyle = { background: 'var(--red-dim)', border: '2px solid var(--red)', color: 'var(--red)' };
   }
 
+  const gridHeight = tileSize * 4 + GAP * 3;
+
   return (
-    <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
+    <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+      {/* Word bubble */}
       <div style={{ height: 52, display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%' }}>
         <div className="font-mono" style={{
           ...bubbleStyle, borderRadius: 28, padding: '10px 24px',
@@ -226,52 +281,70 @@ export default function GameBoard({ board, onWordFound, onWordAttempt, foundWord
         </div>
       </div>
 
+      {/* Grid — full width, canvas overlay for lines */}
       <div
         ref={wrapperRef}
         style={{
-          position: 'relative', touchAction: 'none',
-          userSelect: 'none', WebkitUserSelect: 'none',
+          position: 'relative',
+          touchAction: 'none',
+          userSelect: 'none',
+          WebkitUserSelect: 'none',
           width: '100%',
-          maxWidth: '100%',
+          height: gridHeight,
         }}
-        onMouseDown={e => { computeGrid(); startDrag(e.clientX, e.clientY); }}
+        onMouseDown={e => {
+          const wrapper = wrapperRef.current;
+          if (wrapper) gridOrigin.current = { x: wrapper.getBoundingClientRect().left, y: wrapper.getBoundingClientRect().top };
+          computeLayout();
+          startDrag(e.clientX, e.clientY);
+        }}
         onMouseMove={e => { if (dragging.current) moveDrag(e.clientX, e.clientY); }}
         onMouseUp={endDrag}
         onMouseLeave={endDrag}
       >
-        <svg ref={svgRef} style={{
-          position: 'absolute', top: 0, left: 0,
-          width: '100%', height: '100%', pointerEvents: 'none', zIndex: 1,
-        }} />
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(4, 1fr)',
-          gap: 5,
-          width: '100%',
-        }}>
-          {board.map((letter, i) => {
-            const isActive = path[path.length - 1] === i;
-            const isInPath = path.includes(i) && !isActive;
-            return (
-              <div key={i} ref={el => { tileRefs.current[i] = el; }} style={{
-                aspectRatio: '1',
+        {/* Canvas for drawing path lines — sits above tiles */}
+        <canvas
+          ref={canvasRef}
+          style={{
+            position: 'absolute', top: 0, left: 0,
+            width: '100%', height: '100%',
+            pointerEvents: 'none', zIndex: 10,
+          }}
+        />
+
+        {/* Tiles positioned absolutely for precise layout */}
+        {board.map((letter, i) => {
+          const col = i % 4;
+          const row = Math.floor(i / 4);
+          const isActive = path[path.length - 1] === i;
+          const isInPath = path.includes(i) && !isActive;
+
+          return (
+            <div
+              key={i}
+              style={{
+                position: 'absolute',
+                left: col * (tileSize + GAP),
+                top: row * (tileSize + GAP),
+                width: tileSize,
+                height: tileSize,
                 background: isActive ? 'var(--tile-active)' : isInPath ? '#1e3a5f' : 'var(--tile-bg)',
                 border: `2px solid ${isActive ? '#3b82f6' : isInPath ? '#2563eb' : 'var(--tile-border)'}`,
-                borderRadius: 12,
+                borderRadius: 14,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 fontFamily: "'Bebas Neue', sans-serif",
-                fontSize: 'clamp(28px, 8.5vw, 38px)',
+                fontSize: Math.round(tileSize * 0.42),
                 color: isActive ? '#fff' : isInPath ? 'var(--blue)' : 'var(--text)',
-                transform: isActive ? 'scale(1.08)' : 'scale(1)',
+                transform: isActive ? 'scale(1.1)' : 'scale(1)',
                 transition: 'transform 0.06s, background 0.06s, border-color 0.06s',
-                boxShadow: isActive ? '0 0 20px var(--tile-glow)' : 'none',
-                zIndex: isActive ? 2 : 1, position: 'relative',
-              }}>
-                {letter}
-              </div>
-            );
-          })}
-        </div>
+                boxShadow: isActive ? '0 0 24px var(--tile-glow)' : 'none',
+                zIndex: isActive ? 2 : 1,
+              }}
+            >
+              {letter}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

@@ -235,9 +235,3 @@ Add a `tournaments` table in Supabase and create bracket logic in the server. EL
 
 ### Push notifications (score updates)
 Use Supabase Realtime to subscribe to the `games` table for live score feeds on the leaderboard.
-
----
-
-## License
-
-MIT

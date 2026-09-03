@@ -1,4 +1,4 @@
-# 🔤 Word Hunt — Rated Competitive
+# Word Hunt — Rated Competitive
 
 A Chess.com-style competitive word game built on GamePigeon's Word Hunt rules.  
 Real-time multiplayer · ELO rating system · Solo + Matchmaking + Private rooms
